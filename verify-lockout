@@ -1,0 +1,177 @@
+#!/bin/sh
+# verify-lockout
+#
+# Layer 6: verification checklist. Read-only. Exit non-zero if any critical check
+# fails. Prefers the LIVE settingsservice state (luna-send) over the flat files,
+# because the service DB -- not the files -- is what actually governs behaviour.
+#
+# MANUAL / DIAGNOSTIC ONLY -- do NOT place this in init.d (it is not a boot hook).
+# Run by hand:  sh verify-lockout
+#
+# Testing: LG_LOCKOUT_ROOT (file paths), LG_LUNA_SEND, LG_LOG.
+
+set -u
+
+case "${1:-}" in
+    -h|--help) echo "usage: sh verify-lockout   (read-only; exit 0 = all pass)"; exit 0 ;;
+esac
+
+ROOT="${LG_LOCKOUT_ROOT:-}"
+LUNA="${LG_LUNA_SEND:-luna-send}"
+LOG="${LG_LOG:-$ROOT/var/lib/webosbrew/lg-lockout.log}"
+GET_URI="luna://com.webos.settingsservice/getSystemSettings"
+
+EXPECT_HOSTS="snu.lge.com nextlgsdp.com info.lgsmartad.com api.lgtviot.com ngfts.lge.com"
+HOSTS_FILE="$ROOT/etc/hosts"
+EULA_FILE="$ROOT/var/luna/preferences/eula"
+OPTION_FILE="$ROOT/var/luna/preferences/option"
+GENERAL_FILE="$ROOT/var/luna/preferences/general"
+RESOLV_CONF="$ROOT/etc/resolv.conf"
+ACR_OPTOUT="$ROOT/mnt/lg/cmn_data/acr/data/eula_disallowed_rebooted"
+ACR_XML="${LG_ACR_XML:-$ROOT/tmp/acr.xml}"
+UPDATE_INFO="$ROOT/mnt/lg/cmn_data/var/palm/data/com.webos.appInstallService/updateInfo"
+
+PASS=0; FAIL=0
+ok()  { PASS=$((PASS+1)); echo "  [PASS] $*"; }
+bad() { FAIL=$((FAIL+1)); echo "  [FAIL] $*"; }
+sec() { echo; echo "== $* =="; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- pick data source: live settingsservice if available, else flat files ---
+LUNA_OK=0
+if have "$LUNA" && "$LUNA" -f -n 1 "$GET_URI" '{"category":"general"}' 2>/dev/null \
+        | grep -qE '"returnValue"[[:space:]]*:[[:space:]]*true'; then
+    LUNA_OK=1
+    EULA_SRC=$("$LUNA" -f -n 1 "$GET_URI" '{"keys":["eulaStatus"]}' 2>/dev/null)
+    OPT_SRC=$("$LUNA" -f -n 1 "$GET_URI" '{"category":"option"}' 2>/dev/null)
+    GEN_SRC=$("$LUNA" -f -n 1 "$GET_URI" '{"category":"general"}' 2>/dev/null)
+    SRCNOTE="live settingsservice (luna-send)"
+else
+    EULA_SRC=$(cat "$EULA_FILE" 2>/dev/null)
+    OPT_SRC=$(cat "$OPTION_FILE" 2>/dev/null)
+    GEN_SRC=$(cat "$GENERAL_FILE" 2>/dev/null)
+    SRCNOTE="flat files (luna-send unavailable)"
+fi
+
+is_false() { printf '%s' "$1" | grep -qE "\"$2\"[[:space:]]*:[[:space:]]*false"; }
+is_val()   { printf '%s' "$1" | grep -qE "\"$2\"[[:space:]]*:[[:space:]]*\"$3\""; }
+
+echo "  [INFO] consent/settings source: $SRCNOTE"
+[ -n "$ROOT" ] && echo "  [INFO] LG_LOCKOUT_ROOT=$ROOT"
+
+# ---------------------------------------------------------------------------
+sec "1. /etc/hosts block entries"
+HOSTS_CONTENT=$(cat "$HOSTS_FILE" 2>/dev/null)
+sinkhole_has() {  # host present as a token on any 0.0.0.0/127.0.0.1/::1 line?
+    printf '%s\n' "$HOSTS_CONTENT" | grep -E '^(0\.0\.0\.0|127\.0\.0\.1|::1)[[:space:]]' | grep -qwF "$1"
+}
+for h in $EXPECT_HOSTS; do
+    if sinkhole_has "$h"; then ok "hosts blocks $h"; else bad "hosts does NOT block $h"; fi
+done
+if mount 2>/dev/null | grep -q " on /etc/hosts "; then
+    ok "hosts is a bind mount (persistent block active)"
+else
+    bad "hosts is NOT a bind mount"
+fi
+
+# ---------------------------------------------------------------------------
+sec "2. Telemetry / phone-home processes"
+for p in sdx uploadd rdxd admanager; do
+    if pgrep -x "$p" >/dev/null 2>&1; then
+        echo "  [INFO] $p is RUNNING (may be failing to reach LG now -- check section 4)"
+    else
+        ok "$p not running"
+    fi
+done
+echo "  [INFO] note: sdx/uploadd/rdxd may still run but fail to phone home -- that is the goal."
+
+# ---------------------------------------------------------------------------
+sec "3. Consent / ToS state"
+if [ -n "$EULA_SRC" ]; then
+    for k in networkAllowed acrAllowed voiceAllowed; do
+        if is_false "$EULA_SRC" "$k"; then ok "eula: $k=false"; else bad "eula: $k is not false"; fi
+    done
+else
+    bad "eulaStatus not readable"
+fi
+
+if [ -n "$OPT_SRC" ]; then
+    for k in voiceAllowed voice2Allowed usageCare dbgLogUpload faultLogUpload; do
+        if is_false "$OPT_SRC" "$k"; then ok "option: $k=false"; else bad "option: $k is not false"; fi
+    done
+    for kv in watchedListCollection thirdPartyCookie; do
+        if is_val "$OPT_SRC" "$kv" off; then ok "option: $kv=off"; else bad "option: $kv is not off"; fi
+    done
+else
+    bad "option settings not readable"
+fi
+
+if [ -n "$GEN_SRC" ]; then
+    if is_val "$GEN_SRC" voiceLongDistance off; then ok "general: voiceLongDistance=off"; else bad "general: voiceLongDistance is not off"; fi
+    for kv in aiNudge screenSaverAd homePromotion; do
+        if is_val "$GEN_SRC" "$kv" off; then ok "general: $kv=off"; else bad "general: $kv is not off"; fi
+    done
+    if is_false "$GEN_SRC" launchEulaByHome; then ok "general: launchEulaByHome=false"; else bad "general: launchEulaByHome is not false"; fi
+else
+    bad "general settings not readable"
+fi
+
+# ACR: the authoritative runtime signal is /tmp/acr.xml (ACR_On + capture),
+# NOT the eula_* marker files (which don't exist on all firmware).
+if [ -f "$ACR_XML" ]; then
+    if grep -q 'ACR_On="false"' "$ACR_XML" 2>/dev/null; then ok "acr.xml: ACR_On=false"
+    elif grep -q 'ACR_On="true"' "$ACR_XML" 2>/dev/null; then bad "acr.xml: ACR_On=true (ACR still active)"
+    else echo "  [WARN] acr.xml: ACR_On attribute not found"; fi
+    if grep -q 'capture="true"' "$ACR_XML" 2>/dev/null; then bad "acr.xml: capture=\"true\" present (still capturing)"
+    else ok "acr.xml: no capture=\"true\""; fi
+else
+    echo "  [INFO] $ACR_XML not present (ACR runtime config not generated); relying on eulaStatus.acrAllowed"
+fi
+if [ -f "$ACR_OPTOUT" ]; then echo "  [INFO] acr opt-out marker present (secondary signal)"
+else echo "  [INFO] acr opt-out marker absent (not used on this firmware; acr.xml/eulaStatus are authoritative)"; fi
+
+# ---------------------------------------------------------------------------
+sec "4. Outbound connections to LG domains"
+if have netstat; then
+    HITS=$(netstat -tn 2>/dev/null | grep -E ':(443|80|5100)[[:space:]]+ESTABLISHED|:(443|80|5100)[[:space:]]+CLOSE_WAIT' \
+           | grep -E 'lge\.com|lgsdp\.com|lgsmartad\.com|lgappstv\.com|lgtviot\.com|lgtvcommon\.com|lgthinq\.com|nextlgsdp\.com|wiselg\.com' || true)
+    if [ -n "$HITS" ]; then
+        echo "  [WARN] live connections to LG domains found:"; echo "$HITS" | sed 's/^/    /'
+    else
+        ok "no established/close-wait connections to LG domains"
+    fi
+else
+    echo "  [INFO] netstat not available; skipping connection check"
+fi
+
+# ---------------------------------------------------------------------------
+sec "5. DNS resolver"
+if grep -qE '^(nameserver[[:space:]]+(127\.0\.0\.1|::1))' "$RESOLV_CONF" 2>/dev/null; then
+    echo "  [INFO] resolver is the local connman proxy -- upstream blocking must be at the router"
+else
+    bad "resolv.conf does not point at the local proxy"
+fi
+
+# ---------------------------------------------------------------------------
+sec "6. App-update gate"
+if [ -f "$UPDATE_INFO" ]; then
+    SZ=$(wc -c < "$UPDATE_INFO" 2>/dev/null || echo "?")
+    if [ "$SZ" = "0" ] || [ "$SZ" = "2" ]; then ok "updateInfo is empty ($SZ bytes)"
+    else echo "  [WARN] updateInfo is $SZ bytes (may have been re-created by the app store)"; fi
+else
+    ok "updateInfo absent"
+fi
+
+# ---------------------------------------------------------------------------
+sec "7. Boot-hook log (did init.d run?)"
+if [ -f "$LOG" ]; then
+    echo "  last lines of $LOG:"
+    tail -n 12 "$LOG" 2>/dev/null | sed 's/^/    /'
+else
+    echo "  [INFO] no boot log at $LOG yet (scripts have not run, or ran before logging was added)"
+fi
+
+# ---------------------------------------------------------------------------
+echo
+echo "Result: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ] && exit 0 || exit 1

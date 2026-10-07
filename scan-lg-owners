@@ -1,0 +1,149 @@
+#!/bin/sh
+# scan-lg-owners
+#
+# READ-ONLY diagnostic. Finds which systemd services, binaries, scripts, and
+# config files reference a set of keywords -- used to identify what clobbers a
+# setting after our init.d hooks run at boot (e.g. what re-enables ACR or
+# dbgLogUpload, or who owns /mnt/lg/cmn_data/acr and /tmp/acr.xml).
+#
+# It does four things:
+#   1. Maps every service's ExecStart* binaries -> service name (via systemctl cat).
+#   2. Greps unit files + those binaries + common webOS dirs for each keyword
+#      (binary-safe: string literals embedded in ELF daemons are what we want).
+#   3. Shows the LIVE process holding the target paths open (fuser/lsof + /proc),
+#      mapping pid -> systemd unit via /proc/<pid>/cgroup.
+#   4. Hunts for the acr.xml generator (files containing 'acr_config').
+#
+# Makes NO changes. Run on the TV as root (needs read access to service binaries):
+#   sh scan-lg-owners                       # default ACR + dbgLogUpload hunt
+#   sh scan-lg-owners dbgLogUpload          # hunt one keyword
+#   sh scan-lg-owners 'ACR_On' 'acr.xml'    # hunt several
+#
+# Tunables:
+#   LG_SCAN_DIRS   dirs to grep (default: /usr/sbin /usr/bin /usr/palm /etc)
+#   LG_LIVE_TARGETS paths to check for live holders (default: acr.xml + acr dir)
+#   LG_SERVICE_LIST fallback file of service names if systemctl is unavailable
+
+set -u
+
+if [ "$#" -gt 0 ]; then KEYWORDS="$*"; else
+    KEYWORDS="/mnt/lg/cmn_data/acr eula_disallowed eula_allowed acr.xml ACR_On acr_config dbgLogUpload faultLogUpload"
+fi
+SCAN_DIRS="${LG_SCAN_DIRS:-/usr/sbin /usr/bin /usr/palm /etc}"
+GEN_DIRS="${LG_GEN_DIRS:-/usr/sbin /usr/bin /usr/palm /usr/lib /etc}"
+UNIT_DIRS="${LG_UNIT_DIRS:-/etc/systemd/system /lib/systemd/system /usr/lib/systemd/system}"
+LIVE_TARGETS="${LG_LIVE_TARGETS:-/tmp/acr.xml /mnt/lg/cmn_data/acr /mnt/lg/cmn_data/acr/data}"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+line() { echo "------------------------------------------------------------"; }
+
+echo "== scan-lg-owners (read-only) =="
+echo "keywords : $KEYWORDS"
+echo "scan dirs: $SCAN_DIRS"
+echo
+
+TBL="${TMPDIR:-/tmp}/scan_owners_tbl.$$"; : > "$TBL"
+trap 'rm -f "$TBL" "$TBL.cand" 2>/dev/null' EXIT INT TERM
+
+svc_list() {
+    if have systemctl; then
+        systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}'
+    elif [ -n "${LG_SERVICE_LIST:-}" ] && [ -f "${LG_SERVICE_LIST:-}" ]; then
+        awk 'NR>1{print $1}' "$LG_SERVICE_LIST"
+    fi
+}
+
+# --- Part 1: ExecStart binary -> service map ---
+echo "[1/4] mapping service ExecStart binaries ..."
+for svc in $(svc_list); do
+    systemctl cat "$svc" 2>/dev/null \
+        | sed -n 's/^Exec[A-Za-z]*=//p' \
+        | while IFS= read -r cmd; do
+            # strip leading systemd modifiers (- + ! @ :) then take argv[0]
+            cmd=${cmd#[-+!@:]}; cmd=${cmd#[-+!@:]}; cmd=${cmd#[-+!@:]}
+            set -- $cmd
+            bin=${1:-}
+            [ -n "$bin" ] && printf '%s|%s\n' "$bin" "$svc" >> "$TBL"
+        done
+done
+NBINS=$(cut -d'|' -f1 "$TBL" 2>/dev/null | sort -u | wc -l)
+echo "      found $NBINS distinct ExecStart binaries across services"
+
+owner_of() { awk -F'|' -v f="$1" '$1==f{print $2}' "$TBL" 2>/dev/null | sort -u | paste -sd, - ; }
+
+# --- Part 2: candidate files matching ANY keyword (single traversal) ---
+echo "[2/4] scanning binaries / scripts / units for keywords ..."
+GA=""
+for kw in $KEYWORDS; do GA="$GA -e $kw"; done
+# shellcheck disable=SC2086
+grep -rlasF $GA $SCAN_DIRS $UNIT_DIRS 2>/dev/null | sort -u > "$TBL.cand"
+# include ExecStart binaries that live outside SCAN_DIRS
+for b in $(cut -d'|' -f1 "$TBL" | sort -u); do
+    [ -f "$b" ] || continue
+    # shellcheck disable=SC2086
+    grep -qasF $GA "$b" 2>/dev/null && echo "$b" >> "$TBL.cand"
+done
+sort -u "$TBL.cand" -o "$TBL.cand" 2>/dev/null
+
+echo
+for kw in $KEYWORDS; do
+    line; echo "KEYWORD: $kw"; line
+    _any=0
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        if grep -qasF "$kw" "$f" 2>/dev/null; then
+            _any=1
+            own=$(owner_of "$f")
+            if [ -n "$own" ]; then
+                echo "  $f   <- service: $own"
+            else
+                case "$f" in
+                    */usr/palm/services/*) sd=$(echo "$f" | sed 's#.*/usr/palm/services/##; s#/.*##'); echo "  $f   (palm service: $sd)" ;;
+                    *.service) echo "  $f   (unit file)" ;;
+                    *) echo "  $f" ;;
+                esac
+            fi
+        fi
+    done < "$TBL.cand"
+    [ "$_any" = 0 ] && echo "  (no matches)"
+done
+
+# --- Part 3: live holders of the target paths ---
+echo
+line; echo "LIVE HOLDERS (which running process has these paths open right now)"; line
+unit_of_pid() {
+    # map a pid to its systemd .service via cgroup
+    sed -n 's#.*/\([A-Za-z0-9_.@-]*\.service\).*#\1#p' "/proc/$1/cgroup" 2>/dev/null | head -1
+}
+for t in $LIVE_TARGETS; do
+    echo "  $t:"
+    [ -e "$t" ] || { echo "    (path does not exist right now)"; continue; }
+    pids=""
+    if have fuser; then pids=$(fuser "$t" 2>/dev/null | tr -cs '0-9' ' '); fi
+    [ -z "$pids" ] && have lsof && pids=$(lsof -t -- "$t" 2>/dev/null | tr '\n' ' ')
+    if [ -z "$pids" ]; then echo "    (no live holder / not held open at this instant)"; continue; fi
+    for p in $pids; do
+        exe=$(readlink "/proc/$p/exe" 2>/dev/null)
+        unit=$(unit_of_pid "$p")
+        own=""; [ -n "$exe" ] && own=$(owner_of "$exe")
+        echo "    pid $p  exe=${exe:-?}  unit=${unit:-?}${own:+  execstart-of:$own}"
+    done
+done
+
+# --- Part 4: acr.xml generator candidates ---
+echo
+line; echo "acr.xml GENERATOR CANDIDATES (files containing 'acr_config')"; line
+# shellcheck disable=SC2086
+found=$(grep -rlasF 'acr_config' $GEN_DIRS 2>/dev/null | sort -u)
+if [ -n "$found" ]; then
+    printf '%s\n' "$found" | while IFS= read -r f; do
+        own=$(owner_of "$f"); echo "  $f${own:+   <- service: $own}"
+    done
+else
+    echo "  (none found in: $GEN_DIRS)"
+fi
+
+echo
+echo "done. Nothing was modified."
+echo "Tip: to watch a value change live during/after boot, run e.g.:"
+echo "  while :; do date; luna-send -f -n 1 luna://com.webos.settingsservice/getSystemSettings '{\"category\":\"option\"}' | grep dbgLogUpload; sleep 3; done"

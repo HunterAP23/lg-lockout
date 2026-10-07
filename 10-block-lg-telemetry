@@ -1,0 +1,153 @@
+#!/bin/sh
+# 10-block-lg-telemetry
+#
+# Layer 3 (init.d): bind-mount a comprehensive /etc/hosts blocklist every boot.
+#
+# BOOT ORDER (confirmed from webosbrew services/startup.sh): when
+# /var/luna/preferences/webosbrew_block_updates is set, startup.sh FIRST does
+#   cp /etc/hosts /tmp/hosts ; mount --bind /tmp/hosts /etc/hosts
+# and appends its 4 core OTA domains -- THEN, later, it runs
+#   run-parts /var/lib/webosbrew/init.d
+# so THIS script runs AFTER the webosbrew mount. We therefore detect our own
+# MARKER inside /etc/hosts (not "is it merely mounted") and stack our own bind
+# mount on top, preserving webosbrew's entries. This is the fix for the original
+# `mount | grep " on /etc/hosts "` bug (which took a no-op refresh branch because
+# webosbrew had already mounted /etc/hosts).
+#
+# Runs from init.d (no dot in filename, chmod 755). Also runnable by hand:
+#   sh 10-block-lg-telemetry
+#
+# Opt out without uninstalling: create
+#   /var/luna/preferences/webosbrew_block_updates_extra_off
+#
+# Testing knobs default to real paths:
+#   LG_HOSTS_SRC, LG_HOSTS_TMP, LG_MOUNT_POINT, LG_OPTOUT_FLAG, LG_LOG
+
+set -u
+
+HOSTS_SRC="${LG_HOSTS_SRC:-/etc/hosts}"
+HOSTS_TMP="${LG_HOSTS_TMP:-/tmp/hosts.lg-block}"
+MOUNT_POINT="${LG_MOUNT_POINT:-/etc/hosts}"
+OPTOUT_FLAG="${LG_OPTOUT_FLAG:-/var/luna/preferences/webosbrew_block_updates_extra_off}"
+LOG="${LG_LOG:-${LG_LOCKOUT_ROOT:-}/var/lib/webosbrew/lg-lockout.log}"
+MARKER='# LG lockout block list (10-block-lg-telemetry)'
+
+BLOCK_HOSTS='
+# --- OTA / OS updates ---
+snu.lge.com
+su.lge.com
+su-ssl.lge.com
+nsu.lge.com
+snu-dev.lge.com
+su-dev.lge.com
+
+# --- SDX telemetry: nextlgsdp.com family ---
+nextlgsdp.com
+ibs.nextlgsdp.com
+ibsstat.nextlgsdp.com
+rdx2.nextlgsdp.com
+
+# --- SDX telemetry: lgtvcommon.com family ---
+lgtvcommon.com
+netflixvoice.lgtvcommon.com
+nudge.lgtvcommon.com
+homeprv.lgtvcommon.com
+wiseconfig.lgtvcommon.com
+pnv.lgtvcommon.com
+recommend.lgtvcommon.com
+cdpsvc.lgtvcommon.com
+cpauth.lgtvcommon.com
+cdpbeacon.lgtvcommon.com
+rdl.lgtvcommon.com
+wiseresource.lgtvcommon.com
+qcardservice.lgtvcommon.com
+qt2-kic.lab.lgtvcommon.com
+
+# --- SDX telemetry: other ---
+lggalleryplus.com
+tv.wiselg.com
+
+# --- Ads ---
+lgsmartad.com
+info.lgsmartad.com
+
+# --- ThinQ / IoT ---
+lgtviot.com
+api.lgtviot.com
+commonpush.lgtviot.com
+sports.lgtviot.com
+ocp.lgtviot.com
+push.lgtviot.com
+buddy.lgtviot.com
+lgthinq.com
+common.lgthinq.com
+connect-client.lgthinq.com
+
+# --- LLM / AI platform ---
+ngfts.lge.com
+qt2-ngfts.lge.com
+kic-ngfts.lge.com
+kic-qt2-ngfts.lge.com
+
+# --- Voice NLP backend (optional -- breaks voice search, see HOWTO) ---
+# lgsmartweb.com
+
+# --- Content Store tradeoff (optional -- breaks Content Store) ---
+# lgtvsdp.com
+# lgappstv.com
+'
+
+TAG="10-block-lg-telemetry"
+log() {
+    _line="$(date '+%Y-%m-%d %H:%M:%S') [$TAG] $*"
+    echo "$_line" >&2
+    mkdir -p "$(dirname "$LOG")" 2>/dev/null; echo "$_line" >> "$LOG" 2>/dev/null
+}
+
+HOSTS_FILTERED=$(printf '%s\n' "$BLOCK_HOSTS" | sed 's/[[:space:]]*#.*$//' | sed '/^[[:space:]]*$/d')
+
+build_block_file() {  # $1 base, $2 dest
+    _base="$1"; _dest="$2"
+    sed '/^# LG lockout block list/,$d' "$_base" > "$_dest"
+    printf '\n%s\n' "$MARKER" >> "$_dest"
+    printf '%s\n' "$HOSTS_FILTERED" | while IFS= read -r h; do
+        [ -n "$h" ] && printf '0.0.0.0 %s\n' "$h" >> "$_dest"
+    done
+    printf '%s\n' "$HOSTS_FILTERED" | while IFS= read -r h; do
+        [ -n "$h" ] && printf '::1 %s\n' "$h" >> "$_dest"
+    done
+}
+
+do_bind() {  # $1 src, $2 dst
+    mount --bind "$1" "$2" 2>/dev/null && return 0
+    mount -o bind "$1" "$2" 2>/dev/null && return 0
+    return 1
+}
+
+if [ -f "$OPTOUT_FLAG" ]; then
+    log "opt-out flag present; skipping extra block list"
+    exit 0
+fi
+[ -f "$HOSTS_SRC" ] || { log "FATAL: $HOSTS_SRC missing"; exit 1; }
+
+if grep -q '^# LG lockout block list' "$MOUNT_POINT" 2>/dev/null; then
+    log "our block already active; refreshing in place"
+    SCRATCH="${HOSTS_TMP}.new.$$"
+    build_block_file "$MOUNT_POINT" "$SCRATCH"
+    cat "$SCRATCH" > "$HOSTS_TMP"
+    rm -f "$SCRATCH"
+    log "refreshed block list ($(grep -c '^0\.0\.0\.0 ' "$HOSTS_TMP") hosts)"
+    exit 0
+fi
+
+build_block_file "$MOUNT_POINT" "$HOSTS_TMP"
+if do_bind "$HOSTS_TMP" "$MOUNT_POINT"; then
+    if grep -q '^# LG lockout block list' "$MOUNT_POINT" 2>/dev/null; then
+        log "bind-mounted block list over $MOUNT_POINT ($(grep -c '^0\.0\.0\.0 ' "$HOSTS_TMP") hosts)"
+        exit 0
+    fi
+    log "WARNING: bind reported success but marker not visible in $MOUNT_POINT"
+    exit 1
+fi
+log "WARNING: bind mount failed (tried 'mount --bind' and 'mount -o bind')"
+exit 1

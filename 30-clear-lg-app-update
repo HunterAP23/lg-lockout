@@ -1,0 +1,62 @@
+#!/bin/sh
+# 30-clear-lg-app-update
+#
+# Layer 5 (init.d): wipe the Content Store's cached "update available" state every
+# boot, so the app-update nag never appears. Pure shell -- no python.
+#
+# Wipes (with timestamped backups) and recreates empty:
+#   /mnt/lg/cmn_data/var/palm/data/com.webos.appInstallService/updateInfo
+#   /mnt/lg/cmn_data/var/palm/data/com.webos.appInstallService/updateDependencyInfo
+#
+# updateInfo can be re-created by the app store after boot; running this at boot
+# (and the hosts/DNS layers) is the practical mitigation.
+#
+# init.d (no dot in filename, chmod 755). Also runnable by hand:
+#   sh 30-clear-lg-app-update [--dry-run]
+#
+# Testing: LG_LOCKOUT_ROOT, LG_LOG.
+
+set -u
+
+ROOT="${LG_LOCKOUT_ROOT:-}"
+LOG="${LG_LOG:-$ROOT/var/lib/webosbrew/lg-lockout.log}"
+BASE="$ROOT/mnt/lg/cmn_data/var/palm/data/com.webos.appInstallService"
+UPDATE_INFO="$BASE/updateInfo"
+UPDATE_DEP="$BASE/updateDependencyInfo"
+
+DRY_RUN=0
+case "${1:-}" in
+    ""|--dry-run) [ "${1:-}" = "--dry-run" ] && DRY_RUN=1 ;;
+    -h|--help) echo "usage: sh 30-clear-lg-app-update [--dry-run]"; exit 0 ;;
+    *) echo "30-clear-lg-app-update: unknown argument '$1'" >&2; exit 2 ;;
+esac
+
+TAG="30-clear-lg-app-update"
+log() {
+    _line="$(date '+%Y-%m-%d %H:%M:%S') [$TAG] $*"
+    echo "$_line" >&2
+    [ "$DRY_RUN" = 1 ] || { mkdir -p "$(dirname "$LOG")" 2>/dev/null; echo "$_line" >> "$LOG" 2>/dev/null; }
+}
+
+[ "$DRY_RUN" = 1 ] && log "DRY-RUN -- no files will be modified"
+
+for f in "$UPDATE_INFO" "$UPDATE_DEP"; do
+    if [ -e "$f" ]; then
+        if [ "$DRY_RUN" = 0 ]; then
+            mv -f "$f" "$f.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null && log "moved aside: $f"
+        else
+            log "would move aside: $f"
+        fi
+    else
+        log "not present: $f"
+    fi
+done
+
+if [ "$DRY_RUN" = 0 ] && [ -d "$BASE" ]; then
+    for f in "$UPDATE_INFO" "$UPDATE_DEP"; do
+        [ -e "$f" ] || { : > "$f" 2>/dev/null && log "created empty: $f"; }
+    done
+fi
+
+log "done."
+exit 0

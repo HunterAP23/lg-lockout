@@ -1,0 +1,242 @@
+#!/bin/sh
+# 20-decline-lg-tos
+#
+# Layer 4 (init.d): decline every LG consent AND enforce the privacy-relevant
+# option/general settings on every boot, via luna-send (persists in the
+# settingsservice DB; direct file edits get overwritten by the service).
+#
+# Two settings are known to be re-applied by an LG service AFTER our hook runs at
+# boot (a boot race): dbgLogUpload (flipped back on) and ACR (acr.xml regenerated
+# with ACR_On="true"). To win that race we ALSO:
+#   * neutralise /tmp/acr.xml (ACR_On + capture -> false), and
+#   * schedule delayed re-assertion passes (via systemd-run) that re-apply the
+#     settings 30/90/180s after boot, once the offending service has settled.
+# Use scan-lg-owners to identify the exact service; set LG_ACR_SERVICE=<unit> to
+# have this script restart it after rewriting acr.xml.
+#
+# eulaStatus is a CONSENT record (networkAllowed=false withdraws consent for LG
+# network data collection; it does NOT disconnect the TV). On some webOS versions
+# eulaStatus is rebuilt from the accepted-agreement documents at boot, so we also
+# clear the per-document accepted flags in the eula file (no Luna setter exists).
+#
+# Usage:
+#   sh 20-decline-lg-tos               full apply (used at boot by run-parts)
+#   sh 20-decline-lg-tos --dry-run     preview, change nothing
+#   sh 20-decline-lg-tos --reassert-once   one lightweight re-apply pass
+#                                          (scheduled automatically after boot)
+#
+# Testing knobs (default to real TV values):
+#   LG_LOCKOUT_ROOT, LG_LUNA_SEND, LG_LOG, LG_WAIT_TRIES, LG_ACR_XML,
+#   LG_ACR_SERVICE, LG_REASSERT_DELAYS ("30 90 180"), LG_NO_SCHEDULE=1
+
+set -u
+
+ROOT="${LG_LOCKOUT_ROOT:-}"
+LUNA="${LG_LUNA_SEND:-luna-send}"
+LOG="${LG_LOG:-$ROOT/var/lib/webosbrew/lg-lockout.log}"
+WAIT_TRIES="${LG_WAIT_TRIES:-20}"
+ACR_XML="${LG_ACR_XML:-$ROOT/tmp/acr.xml}"
+REASSERT_DELAYS="${LG_REASSERT_DELAYS:-30 90 180}"
+
+EULA_FILE="$ROOT/var/luna/preferences/eula"
+OPTION_FILE="$ROOT/var/luna/preferences/option"
+GENERAL_FILE="$ROOT/var/luna/preferences/general"
+ACR_STATE_DIR="$ROOT/mnt/lg/cmn_data/acr/data"
+ACR_ALLOW_MARKER="$ACR_STATE_DIR/eula_allowed"
+ACR_OPTOUT_MARKER="$ACR_STATE_DIR/eula_disallowed_rebooted"
+
+SETTINGS_URI="luna://com.webos.settingsservice/setSystemSettings"
+GET_URI="luna://com.webos.settingsservice/getSystemSettings"
+
+OPTION_SETTINGS="voiceAllowed:bool:false voice2Allowed:bool:false usageCare:bool:false watchedListCollection:str:off dbgLogUpload:bool:false faultLogUpload:bool:false thirdPartyCookie:str:off"
+GENERAL_SETTINGS="aiNudge:str:off screenSaverAd:str:off homePromotion:str:off launchEulaByHome:bool:false voiceLongDistance:str:off"
+
+DEFAULT_EULA_KEYS="networkAllowed acrAllowed acrAdAllowed acrGdprAllowed acrOnAllowed voiceAllowed voice2Allowed marketingOnAllowed cookiesAllowed customadsAllowed customAdAllowed thirdPartySharingAllowed takeOnAllowed chpAllowed shoppingOnAllowed veranceOnAllowed generalTermsAllowed remoteDiagAllowed additionalDataAllowed additional1Allowed additional2Allowed additional3Allowed additional4Allowed additional5Allowed"
+
+# absolute path to self, so scheduled re-assertion can re-invoke it
+SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+
+DRY_RUN=0; MODE=full
+case "${1:-}" in
+    ""|--dry-run) [ "${1:-}" = "--dry-run" ] && DRY_RUN=1 ;;
+    --reassert-once) MODE=reassert ;;
+    -h|--help)
+        echo "usage: sh 20-decline-lg-tos [--dry-run|--reassert-once]"
+        echo "  Decline LG consents + enforce privacy settings via luna-send."
+        echo "  --reassert-once  one re-apply pass (auto-scheduled after boot)."
+        exit 0 ;;
+    *) echo "20-decline-lg-tos: unknown argument '$1'" >&2; exit 2 ;;
+esac
+
+TAG="20-decline-lg-tos"; [ "$MODE" = reassert ] && TAG="20-decline-lg-tos/reassert"
+log() {
+    _line="$(date '+%Y-%m-%d %H:%M:%S') [$TAG] $*"
+    echo "$_line" >&2
+    [ "$DRY_RUN" = 1 ] || { mkdir -p "$(dirname "$LOG")" 2>/dev/null; echo "$_line" >> "$LOG" 2>/dev/null; }
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+ts() { date +%Y%m%d%H%M%S; }
+
+sed_inplace() {
+    _f=$1; shift; _tmp="$_f.tmp.$$"
+    if sed "$@" "$_f" > "$_tmp" 2>/dev/null; then cat "$_tmp" > "$_f"; rm -f "$_tmp"
+    else rm -f "$_tmp"; return 1; fi
+}
+build_settings_json() {
+    _out=""
+    for _spec in "$@"; do
+        _key=${_spec%%:*}; _rest=${_spec#*:}; _typ=${_rest%%:*}; _val=${_rest#*:}
+        case "$_typ" in bool) _jv=$_val ;; *) _jv="\"$_val\"" ;; esac
+        [ -n "$_out" ] && _out="$_out,"; _out="$_out\"$_key\":$_jv"
+    done
+    printf '{%s}' "$_out"
+}
+luna_set() {
+    if [ "$DRY_RUN" = 1 ]; then log "would luna-send $1"; return 0; fi
+    _resp=$("$LUNA" -f -n 1 "$SETTINGS_URI" "$1" 2>/dev/null)
+    printf '%s' "$_resp" | grep -qE '"returnValue"[[:space:]]*:[[:space:]]*true' && return 0
+    log "luna-send rejected: $(printf '%s' "$_resp" | tr -d '\n' | cut -c1-120)"
+    return 1
+}
+LUNA_OK=0
+init_luna() {
+    _tries="${1:-$WAIT_TRIES}"
+    have "$LUNA" || { log "luna-send not found; using file fallback"; return 1; }
+    _i=0
+    while [ "$_i" -lt "$_tries" ]; do
+        if "$LUNA" -f -n 1 "$GET_URI" '{"category":"general"}' 2>/dev/null | grep -qE '"returnValue"[[:space:]]*:[[:space:]]*true'; then
+            LUNA_OK=1; [ "$_i" -gt 0 ] && log "settingsservice up after $_i tries"; return 0
+        fi
+        _i=$((_i+1)); sleep 2
+    done
+    log "settingsservice not responding after $_tries tries; file fallback"; return 1
+}
+
+eula_status_keys() {
+    _k=$(grep -oE '"[A-Za-z0-9_]+Allowed"' "$EULA_FILE" 2>/dev/null | sed 's/^"//; s/"$//' | sort -u)
+    [ -n "$_k" ] && { printf '%s\n' "$_k"; return; }
+    printf '%s\n' $DEFAULT_EULA_KEYS
+}
+apply_eula() {
+    if [ "$LUNA_OK" = 1 ]; then
+        _obj=""
+        for _k in $(eula_status_keys); do [ -n "$_obj" ] && _obj="$_obj,"; _obj="$_obj\"$_k\":false"; done
+        luna_set "$(printf '{"settings":{"eulaStatus":{%s}}}' "$_obj")" \
+            && log "eulaStatus: all *Allowed flags set false via luna-send"
+    fi
+    if [ -f "$EULA_FILE" ]; then
+        if [ "$DRY_RUN" = 1 ]; then log "eula file: would set *Allowed=false, accepted=false, updated=true"
+        else
+            cp -f "$EULA_FILE" "$EULA_FILE.bak.$(ts)" 2>/dev/null
+            sed_inplace "$EULA_FILE" \
+                -e 's/\("[A-Za-z0-9_]*Allowed"[[:space:]]*:[[:space:]]*\)true/\1false/g' \
+                -e 's/\("accepted"[[:space:]]*:[[:space:]]*\)true/\1false/g' \
+                -e 's/\("updated"[[:space:]]*:[[:space:]]*\)false/\1true/g' \
+                && log "eula file: documents + eulaStatus cleared (sed)"
+        fi
+    else
+        log "WARNING: $EULA_FILE not found; skipped file-level eula edit"
+    fi
+    if [ "$DRY_RUN" = 0 ] && have systemctl; then
+        systemctl restart eula-service 2>/dev/null && log "restarted eula-service" \
+            || log "eula-service restart skipped (not a systemd unit / not running)"
+    fi
+}
+apply_category() {
+    _cat=$1; _file=$2; shift 2
+    if [ "$LUNA_OK" = 1 ]; then
+        _json=$(build_settings_json "$@")
+        luna_set "$(printf '{"category":"%s","settings":%s}' "$_cat" "$_json")" \
+            && { log "$_cat: applied via luna-send ($_json)"; return; }
+        log "$_cat: luna-send failed; trying file fallback"
+    fi
+    [ -f "$_file" ] || { log "WARNING: $_file not found; cannot fall back for $_cat"; return; }
+    if [ "$DRY_RUN" = 1 ]; then log "$_cat: would edit $_file"; return; fi
+    cp -f "$_file" "$_file.bak.$(ts)" 2>/dev/null
+    for _spec in "$@"; do
+        _key=${_spec%%:*}; _rest=${_spec#*:}; _typ=${_rest%%:*}; _val=${_rest#*:}
+        case "$_typ" in
+            bool) _pat="s/\\(\"$_key\"[[:space:]]*:[[:space:]]*\\)true/\\1false/g"; _add="\"$_key\": false" ;;
+            *)    _pat="s/\\(\"$_key\"[[:space:]]*:[[:space:]]*\\)\"[^\"]*\"/\\1\"$_val\"/g"; _add="\"$_key\": \"$_val\"" ;;
+        esac
+        if grep -q "\"$_key\"" "$_file"; then sed_inplace "$_file" -e "$_pat"
+        else
+            awk -v ins="  $_add," 'NR==1 && d!=1 && /{/ { sub(/{/, "{\n" ins); d=1 } { print }' \
+                "$_file" > "$_file.tmp.$$" && cat "$_file.tmp.$$" > "$_file" && rm -f "$_file.tmp.$$"
+            log "$_cat: added missing key $_key to $_file"
+        fi
+    done
+    log "$_cat: applied via file edit"
+}
+neutralize_acr_xml() {
+    if [ ! -f "$ACR_XML" ]; then log "acr.xml: $ACR_XML not present yet (skipped)"; return; fi
+    if grep -q 'ACR_On="false"' "$ACR_XML" 2>/dev/null && ! grep -q 'capture="true"' "$ACR_XML" 2>/dev/null; then
+        log "acr.xml: already neutralized"; return
+    fi
+    if [ "$DRY_RUN" = 1 ]; then log "acr.xml: would set ACR_On=false and capture=false"; return; fi
+    cp -f "$ACR_XML" "$ACR_XML.bak.$(ts)" 2>/dev/null
+    sed_inplace "$ACR_XML" -e 's/ACR_On="true"/ACR_On="false"/g' -e 's/capture="true"/capture="false"/g' \
+        && log "acr.xml: set ACR_On=false and capture=false"
+    if [ -n "${LG_ACR_SERVICE:-}" ] && have systemctl; then
+        systemctl restart "$LG_ACR_SERVICE" 2>/dev/null && log "restarted $LG_ACR_SERVICE (ACR owner)" \
+            || log "restart of $LG_ACR_SERVICE failed"
+    fi
+}
+apply_acr_marker() {
+    if [ "$DRY_RUN" = 1 ]; then log "acr marker: would write $ACR_OPTOUT_MARKER"; return; fi
+    mkdir -p "$ACR_STATE_DIR" 2>/dev/null
+    [ -f "$ACR_ALLOW_MARKER" ] && mv -f "$ACR_ALLOW_MARKER" "$ACR_ALLOW_MARKER.bak.$(ts)" 2>/dev/null \
+        && log "acr marker: moved aside eula_allowed"
+    : > "$ACR_OPTOUT_MARKER" 2>/dev/null && log "acr marker: wrote opt-out marker (secondary; acr.xml is authoritative)"
+}
+bound_log() {
+    [ "$DRY_RUN" = 0 ] && [ -f "$LOG" ] && \
+        tail -n 500 "$LOG" > "$LOG.tmp.$$" 2>/dev/null && cat "$LOG.tmp.$$" > "$LOG" && rm -f "$LOG.tmp.$$"
+}
+
+schedule_reassert() {
+    [ "${LG_NO_SCHEDULE:-0}" = 1 ] && return
+    if [ "$DRY_RUN" = 1 ]; then log "would schedule re-assertion passes at: $REASSERT_DELAYS s"; return; fi
+    _sh=$(command -v sh 2>/dev/null || echo /bin/sh)
+    if have systemd-run; then
+        for _d in $REASSERT_DELAYS; do
+            systemd-run --quiet --on-active="${_d}s" --timer-property=AccuracySec=1s \
+                "$_sh" "$SELF" --reassert-once >/dev/null 2>&1 \
+                && log "scheduled re-assertion at +${_d}s (systemd-run)" \
+                || log "systemd-run scheduling at +${_d}s failed"
+        done
+    else
+        ( for _d in $REASSERT_DELAYS; do sleep "$_d"; "$_sh" "$SELF" --reassert-once; done ) \
+            </dev/null >/dev/null 2>&1 &
+        log "scheduled re-assertion via detached loop (systemd-run absent)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+full_run() {
+    [ "$DRY_RUN" = 1 ] && log "DRY-RUN -- no changes"
+    [ -n "$ROOT" ] && log "using LG_LOCKOUT_ROOT=$ROOT"
+    init_luna || true
+    apply_eula
+    apply_category option  "$OPTION_FILE"  $OPTION_SETTINGS
+    apply_category general "$GENERAL_FILE" $GENERAL_SETTINGS
+    neutralize_acr_xml
+    apply_acr_marker
+    schedule_reassert
+    log "done."
+    bound_log
+}
+
+# lightweight pass re-run after boot to beat the race on dbgLogUpload / acr.xml
+reassert_run() {
+    init_luna 5 || true
+    apply_category option  "$OPTION_FILE"  $OPTION_SETTINGS
+    apply_category general "$GENERAL_FILE" $GENERAL_SETTINGS
+    neutralize_acr_xml
+    apply_acr_marker
+    log "reassert pass done."
+    bound_log
+}
+
+if [ "$MODE" = reassert ]; then reassert_run; else full_run; fi
+exit 0
